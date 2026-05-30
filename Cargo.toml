@@ -1,0 +1,27 @@
+[package]
+name = "jetson-hal"
+version = "0.1.0"
+edition = "2024"
+description = "Hardware abstraction layer for Jetson-based robots (camera, audio, GPS, motor control)"
+license = "MIT"
+
+[features]
+default = ["camera", "audio", "gps", "motor"]
+camera = ["dep:v4l", "tokio/fs", "tokio/sync"]
+audio = ["dep:alsa", "tokio/sync"]
+gps = ["dep:tokio-serial", "dep:nmea", "dep:glob", "tokio/io-util", "tokio/sync", "tokio/rt", "tokio/time", "tokio/macros"]
+motor = ["dep:tokio-serial", "tokio/io-util", "tokio/sync", "tokio/macros", "tokio/time", "tokio/rt"]
+
+[dependencies]
+tokio = { version = "1", default-features = false, optional = true }
+thiserror = "2"
+tracing = "0.1"
+tokio-serial = { version = "5.4", optional = true }
+v4l = { version = "0.14", optional = true }
+alsa = { version = "0.11", optional = true }
+nmea = { version = "0.7", optional = true }
+glob = { version = "0.3", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util", "rt-multi-thread", "signal"] }
+tracing-subscriber = "0.3"
