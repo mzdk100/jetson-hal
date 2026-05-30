@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 description = "Hardware abstraction layer for Jetson-based robots (camera, audio, GPS, motor control)"
 license = "MIT"
+repository = "https://github.com/mzdk100/jetson-hal.git"
+keywords = ["jetson", "v4l2", "alsa", "robotics", "hal"]
+categories = ["hardware-support", "os::linux-apis"]
 
 [features]
 default = ["camera", "audio", "gps", "motor"]
