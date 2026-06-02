@@ -359,12 +359,22 @@ impl MotorController {
                         if let Err(e) = Self::write_command(&mut *port_commands, "BTN_SELECT") {
                             error!("Failed to send STOP: {}", e);
                         }
+                        // 发送3次V0,0确保STM32收到零速度（匹配Python行为）
+                        for _ in 0..3 {
+                            let _ = Self::write_command(&mut *port_commands, "V0,0");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                         debug!("底盘已关闭");
                     }
                     Some(MotorCommand::EmergencyStop) => {
                         is_started.store(false, Ordering::Relaxed);
                         current_linear.store(0, Ordering::Relaxed);
                         current_angular.store(0, Ordering::Relaxed);
+                        // 先发V0,0再发BTN_XBOX（匹配Python emergency_stop顺序）
+                        for _ in 0..3 {
+                            let _ = Self::write_command(&mut *port_commands, "V0,0");
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
                         if let Err(e) = Self::write_command(&mut *port_commands, "BTN_XBOX") {
                             error!("Failed to send EMERGENCY_STOP: {}", e);
                         }
@@ -386,8 +396,12 @@ impl MotorController {
                         }
                     }
                     None => {
-                        // Channel closed, stop
+                        // Channel closed, clean shutdown (matching Python stop())
                         info!("Command channel closed, stopping serial task");
+                        // 先发V0,0和停止命令，确保STM32安全停止
+                        let _ = Self::write_command(&mut *port_commands, "V0,0");
+                        let _ = Self::write_command(&mut *port_commands, "BTN_SELECT");
+                        std::thread::sleep(Duration::from_millis(100));
                         running.store(false, Ordering::Relaxed);
                         break;
                     }

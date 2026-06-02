@@ -1,6 +1,6 @@
 [package]
 name = "jetson-hal"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Hardware abstraction layer for Jetson-based robots (camera, audio, GPS, motor control)"
 license = "MIT"
