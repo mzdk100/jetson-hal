@@ -1,9 +1,4 @@
-//! Motor control example.
-//!
-//! Connects to the STM32 motor controller and runs a simple movement sequence:
-//! forward → turn right → stop.
-//!
-//! Run: cargo run --example motor_control
+//! Simple motor control example without message handling.
 
 use jetson_hal::{MotorConfig, MotorController, Result};
 use std::time::Duration;
@@ -17,38 +12,42 @@ async fn main() -> Result<()> {
         baudrate: 115200,
         normal_speed: 40,
         turn_speed: 30,
+        control_interval_ms: 20, // 50Hz control loop
+        heartbeat_interval_ms: 100,
         ..Default::default()
     };
 
     println!("Connecting to STM32 on {}...", config.port);
-    let mut ctrl = MotorController::new(config);
+    let ctrl = MotorController::new(config);
     println!("Motor controller ready.\n");
+
+    // Wait for connection to stabilize
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Start motors
     println!("Starting motors...");
     ctrl.start_motors().await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Move forward
-    println!("Moving forward (speed=40)...");
-    ctrl.set_speed(40, 0).await?;
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
-    // Turn right
-    println!("Turning right (speed=30)...");
-    ctrl.set_speed(0, 30).await?;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // Move forward (negative linear speed for forward)
+    println!("Moving forward (linear=-40)...");
+    ctrl.set_speed(-40, 0).await?;
+    tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Stop
     println!("Stopping...");
-    ctrl.stop_motors().await?;
+    //    ctrl.set_speed(0, 0).await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Read any pending messages
-    println!("\nChecking for STM32 messages...");
-    while let Some(msg) = ctrl.recv_message().await {
-        println!("  {:?}", msg);
-    }
+    // Turn right
+    println!("Turning right (angular=30)...");
+    ctrl.set_speed(0, 30).await?;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Final stop
+    println!("Stopping motors...");
+    ctrl.stop_motors().await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     println!("Done.");
     Ok(())

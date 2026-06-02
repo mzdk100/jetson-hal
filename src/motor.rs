@@ -1,16 +1,19 @@
+//! Motor controller implementation for STM32 communication.
+
 use {
     crate::{
         config::MotorConfig,
         error::{JetsonError, Result},
     },
-    std::time::Duration,
-    tokio::{
-        io::{AsyncBufReadExt, AsyncWriteExt, BufReader, split},
-        select, spawn,
-        sync::mpsc,
-        time::{Interval, interval, sleep},
+    std::{
+        io::{Read, Write},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicI32, Ordering},
+        },
+        time::Duration,
     },
-    tokio_serial::SerialPortBuilderExt,
+    tokio::sync::mpsc,
     tracing::{debug, error, info, warn},
 };
 
@@ -34,6 +37,23 @@ pub enum RobotMode {
     Walking,
 }
 
+impl RobotMode {
+    fn from_str(s: &str) -> Option<Self> {
+        match s {
+            "BALANCE_MODE" => Some(RobotMode::Balance),
+            "WALKING_MODE" => Some(RobotMode::Walking),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            RobotMode::Balance => "平衡模式",
+            RobotMode::Walking => "行进模式",
+        }
+    }
+}
+
 /// Motor command to send to STM32.
 #[derive(Debug, Clone)]
 pub enum MotorCommand {
@@ -51,32 +71,19 @@ pub enum MotorCommand {
     EmergencyStop,
 }
 
-impl MotorCommand {
-    fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            MotorCommand::Speed { linear, angular } => {
-                let l = (*linear).clamp(-100, 100);
-                let a = (*angular).clamp(-100, 100);
-                format!("V{},{}\n", l, a).into_bytes()
-            }
-            MotorCommand::Heartbeat => b"HEARTBEAT\n".to_vec(),
-            MotorCommand::Start => b"BTN_START\n".to_vec(),
-            MotorCommand::Stop => b"BTN_SELECT\n".to_vec(),
-            MotorCommand::ModeToggle => b"BTN_A\n".to_vec(),
-            MotorCommand::EmergencyStop => b"BTN_XBOX\n".to_vec(),
-        }
-    }
-}
-
 /// STM32 motor controller interface.
 ///
 /// Communicates with the STM32 microcontroller over serial using a text-based protocol.
-/// Runs a 50Hz control loop to send speed commands and a receive loop to parse responses.
+/// Uses a dedicated writer thread running a 50Hz control loop (matching Python behavior).
 pub struct MotorController {
-    config: MotorConfig,
     cmd_tx: mpsc::Sender<MotorCommand>,
     msg_rx: mpsc::Receiver<Stm32Message>,
+    // Current robot mode (shared with async API)
+    current_mode: Arc<std::sync::RwLock<RobotMode>>,
 }
+
+// Note: MotorController does NOT implement Clone because mpsc::Receiver cannot be cloned
+// If you need multiple references, use Arc<MotorController>
 
 impl MotorController {
     /// Create a new motor controller.
@@ -84,19 +91,16 @@ impl MotorController {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (msg_tx, msg_rx) = mpsc::channel(64);
 
-        let ctrl = MotorController {
-            config,
-            cmd_tx,
-            msg_rx,
-        };
-
-        // Spawn the serial communication task
-        let config_clone = ctrl.config.clone();
-        spawn(async move {
-            Self::serial_task(config_clone, cmd_rx, msg_tx).await;
+        // Spawn the serial communication thread (blocking, like Python)
+        std::thread::spawn(move || {
+            Self::serial_task(config, cmd_rx, msg_tx);
         });
 
-        ctrl
+        MotorController {
+            cmd_tx,
+            msg_rx,
+            current_mode: Arc::new(std::sync::RwLock::new(RobotMode::Balance)),
+        }
     }
 
     /// Send a command to the STM32.
@@ -137,169 +141,286 @@ impl MotorController {
         self.send(MotorCommand::EmergencyStop).await
     }
 
+    /// Get current robot mode.
+    pub fn current_mode(&self) -> RobotMode {
+        *self.current_mode.read().unwrap()
+    }
+
     /// Try to receive a message from STM32 (non-blocking).
     pub async fn recv_message(&mut self) -> Option<Stm32Message> {
         self.msg_rx.recv().await
     }
 
-    /// Main serial task: handles both sending and receiving.
-    async fn serial_task(
+    /// Parse STM32 message.
+    fn parse_stm32_message(line: &str) -> Option<Stm32Message> {
+        if let Some(mode_str) = line.strip_prefix("MODE:") {
+            if let Some(mode) = RobotMode::from_str(mode_str) {
+                return Some(Stm32Message::Mode(mode));
+            }
+        } else if line == "PONG" {
+            return Some(Stm32Message::Pong);
+        }
+
+        debug!("📨 STM32: {}", line);
+        Some(Stm32Message::Unknown(line.to_string()))
+    }
+
+    /// Write a command to the serial port (generic version that works with any SerialPort)
+    fn write_command(port: &mut dyn serialport::SerialPort, cmd: &str) -> Result<()> {
+        let full_cmd = format!("{}\n", cmd);
+        port.write_all(full_cmd.as_bytes())
+            .map_err(|e| JetsonError::Motor(format!("Write failed: {}", e)))?;
+        port.flush()
+            .map_err(|e| JetsonError::Motor(format!("Flush failed: {}", e)))?;
+        Ok(())
+    }
+
+    /// Main serial task: owns the serial port, runs writer thread + command loop.
+    ///
+    /// This is a blocking function that runs in a dedicated thread, matching Python's
+    /// `threading.Thread(target=_control_loop)` pattern.
+    fn serial_task(
         config: MotorConfig,
         mut cmd_rx: mpsc::Receiver<MotorCommand>,
         msg_tx: mpsc::Sender<Stm32Message>,
     ) {
+        let control_interval = Duration::from_millis(config.control_interval_ms);
+        let heartbeat_interval = Duration::from_millis(config.heartbeat_interval_ms);
+
         loop {
-            // Open serial port
-            let serial = match tokio_serial::new(&config.port, config.baudrate)
-                .timeout(Duration::from_millis(500))
-                .open_native_async()
+            // Open serial port (blocking, matching Python's serial.Serial exactly)
+            let port = match serialport::new(&config.port, config.baudrate)
+                .data_bits(serialport::DataBits::Eight)
+                .parity(serialport::Parity::None)
+                .stop_bits(serialport::StopBits::One)
+                .timeout(Duration::from_millis(100))
+                .open()
             {
-                Ok(s) => {
-                    info!("STM32 serial opened: {}", config.port);
-                    s
+                Ok(p) => {
+                    info!("✓ STM32 serial opened: {}", config.port);
+                    p
                 }
                 Err(e) => {
-                    error!("STM32 serial open failed: {}", e);
-                    sleep(Duration::from_secs(3)).await;
+                    error!("❌ STM32 serial open failed: {}", e);
+                    std::thread::sleep(Duration::from_secs(3));
                     continue;
                 }
             };
 
-            let (reader, mut writer) = split(serial);
-            let mut buf_reader = BufReader::new(reader);
+            // Clear buffers (like Python's reset_input_buffer/reset_output_buffer)
+            let _ = port.clear(serialport::ClearBuffer::All);
 
-            let mut heartbeat_interval =
-                interval(Duration::from_millis(config.heartbeat_interval_ms));
-            let mut control_timer = interval(Duration::from_millis(config.control_interval_ms));
-            let mut current_speed = (0i32, 0i32); // (linear, angular)
+            let current_linear = Arc::new(AtomicI32::new(0));
+            let current_angular = Arc::new(AtomicI32::new(0));
+            let is_started = Arc::new(AtomicBool::new(false));
+            let running = Arc::new(AtomicBool::new(true));
 
-            // Run until error
-            let result = Self::run_loop(
-                &mut buf_reader,
-                &mut writer,
-                &mut cmd_rx,
-                &msg_tx,
-                &mut control_timer,
-                &mut heartbeat_interval,
-                &mut current_speed,
-                &config,
-            )
-            .await;
+            // Clone ports for different threads
+            let mut port_writer = port
+                .try_clone()
+                .expect("Failed to clone serial port for writer");
+            let mut port_reader = port
+                .try_clone()
+                .expect("Failed to clone serial port for reader");
+            let mut port_commands = port; // Use original port for commands
 
-            match result {
-                Ok(()) => info!("STM32 serial task ended"),
-                Err(e) => warn!("STM32 serial error: {}", e),
-            }
+            // Shared state for threads
+            let cl = Arc::clone(&current_linear);
+            let ca = Arc::clone(&current_angular);
+            let started = Arc::clone(&is_started);
+            let r_writer = Arc::clone(&running);
+            let r_reader = Arc::clone(&running);
 
-            sleep(Duration::from_secs(1)).await;
-        }
-    }
+            // Writer thread: 50Hz control loop (matches Python _control_loop)
+            let writer_handle = std::thread::spawn(move || {
+                let mut last_heartbeat = std::time::Instant::now();
 
-    /// Main control loop combining send and receive.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_loop(
-        reader: &mut (impl AsyncBufReadExt + Unpin),
-        writer: &mut (impl AsyncWriteExt + Unpin),
-        cmd_rx: &mut mpsc::Receiver<MotorCommand>,
-        msg_tx: &mpsc::Sender<Stm32Message>,
-        control_timer: &mut Interval,
-        heartbeat_timer: &mut Interval,
-        current_speed: &mut (i32, i32),
-        _config: &MotorConfig,
-    ) -> Result<()> {
-        let mut line = String::new();
-        #[allow(unused_assignments)]
-        let mut last_cmd = MotorCommand::Heartbeat;
-        let mut cmd_active = false; // Whether a speed command is active
+                while r_writer.load(Ordering::Relaxed) {
+                    if started.load(Ordering::Relaxed) {
+                        let linear = cl.load(Ordering::Relaxed);
+                        let angular = ca.load(Ordering::Relaxed);
 
-        loop {
-            select! {
-                // Read from STM32
-                result = reader.read_line(&mut line) => {
-                    match result {
-                        Ok(0) => {
-                            return Err(JetsonError::Motor("serial EOF".into()));
+                        // Always send current speed (keep connection alive)
+                        let cmd = format!("V{},{}\n", linear, angular);
+                        if let Err(e) = port_writer.write_all(cmd.as_bytes()) {
+                            debug!("Write failed: {}", e);
+                            break;
+                        }
+                        if let Err(e) = port_writer.flush() {
+                            debug!("Flush failed: {}", e);
+                            break;
+                        }
+
+                        // If no movement, also send heartbeat (double guarantee)
+                        if linear == 0
+                            && angular == 0
+                            && last_heartbeat.elapsed() >= heartbeat_interval
+                        {
+                            let _ = port_writer.write_all(b"HEARTBEAT\n");
+                            let _ = port_writer.flush();
+                            last_heartbeat = std::time::Instant::now();
+                        }
+                    } else {
+                        // Not started: only send heartbeat
+                        if last_heartbeat.elapsed() >= heartbeat_interval {
+                            let _ = port_writer.write_all(b"HEARTBEAT\n");
+                            let _ = port_writer.flush();
+                            last_heartbeat = std::time::Instant::now();
+                        }
+                    }
+
+                    std::thread::sleep(control_interval);
+                }
+            });
+
+            // Reader thread: receive messages from STM32
+            let msg_tx_r = msg_tx.clone();
+            let reader_handle = std::thread::spawn(move || {
+                let mut line_buffer = Vec::new();
+
+                while r_reader.load(Ordering::Relaxed) {
+                    let mut buf = [0u8; 256];
+                    match port_reader.read(&mut buf) {
+                        Ok(n) if n > 0 => {
+                            // Append to line buffer
+                            line_buffer.extend_from_slice(&buf[..n]);
+
+                            // Convert to string and split by lines
+                            if let Ok(text) = String::from_utf8(line_buffer.clone()) {
+                                let lines: Vec<&str> = text.split('\n').collect();
+
+                                // Keep the last incomplete line in buffer
+                                if !text.ends_with('\n') && lines.len() > 1 {
+                                    if let Some(last) = lines.last() {
+                                        line_buffer = last.as_bytes().to_vec();
+                                    } else {
+                                        line_buffer.clear();
+                                    }
+                                } else {
+                                    line_buffer.clear();
+                                }
+
+                                // Process complete lines
+                                for line in lines.iter().take(lines.len() - 1) {
+                                    let line = line.trim();
+                                    if !line.is_empty()
+                                        && let Some(msg) = Self::parse_stm32_message(line)
+                                    {
+                                        let _ = msg_tx_r.blocking_send(msg);
+                                    }
+                                }
+                            } else {
+                                // Invalid UTF-8, clear buffer
+                                line_buffer.clear();
+                            }
                         }
                         Ok(_) => {
-                            let trimmed = line.trim().to_string();
-                            if !trimmed.is_empty() {
-                                let msg = Self::parse_stm32_message(&trimmed);
-                                let _ = msg_tx.send(msg).await;
-                            }
-                            line.clear();
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {
-                            line.clear();
-                            continue;
+                            // No data, just sleep
+                            std::thread::sleep(Duration::from_millis(10));
                         }
                         Err(e) => {
-                            return Err(JetsonError::Motor(format!("serial read: {}", e)));
+                            debug!("Read error: {}", e);
+                            std::thread::sleep(Duration::from_millis(100));
                         }
                     }
                 }
+            });
 
-                // Receive commands from user
-                cmd = cmd_rx.recv() => {
-                    match cmd {
-                        Some(MotorCommand::Speed { linear, angular }) => {
-                            *current_speed = (linear, angular);
-                            last_cmd = MotorCommand::Speed { linear, angular };
-                            cmd_active = true;
-                            let data = last_cmd.to_bytes();
-                            writer.write_all(&data).await
-                                .map_err(|e| JetsonError::Motor(format!("serial write: {}", e)))?;
-                            debug!("STM32 TX: V{},{}", linear, angular);
+            // Command processing loop: receives from user, updates shared state
+            let mut last_mode_toggle_time = std::time::Instant::now();
+            let mode_toggle_cooldown = Duration::from_millis(100);
+
+            loop {
+                match cmd_rx.blocking_recv() {
+                    Some(MotorCommand::Speed { linear, angular }) => {
+                        let linear = linear.clamp(-100, 100);
+                        let angular = angular.clamp(-100, 100);
+
+                        current_linear.store(linear, Ordering::Relaxed);
+                        current_angular.store(angular, Ordering::Relaxed);
+
+                        if linear == 0 && angular == 0 {
+                            debug!("🛑 停止");
+                        } else {
+                            debug!("🚀 V{},{}", linear, angular);
                         }
-                        Some(cmd) => {
-                            let data = cmd.to_bytes();
-                            writer.write_all(&data).await
-                                .map_err(|e| JetsonError::Motor(format!("serial write: {}", e)))?;
-                            debug!("STM32 TX: {:?}", cmd);
-                            if matches!(cmd, MotorCommand::EmergencyStop | MotorCommand::Stop) {
-                                cmd_active = false;
-                                *current_speed = (0, 0);
+                    }
+                    Some(MotorCommand::Start) => {
+                        is_started.store(true, Ordering::Relaxed);
+                        if let Err(e) = Self::write_command(&mut *port_commands, "BTN_START") {
+                            error!("Failed to send START: {}", e);
+                        }
+                        debug!("底盘已启动");
+                    }
+                    Some(MotorCommand::Stop) => {
+                        is_started.store(false, Ordering::Relaxed);
+                        current_linear.store(0, Ordering::Relaxed);
+                        current_angular.store(0, Ordering::Relaxed);
+                        if let Err(e) = Self::write_command(&mut *port_commands, "BTN_SELECT") {
+                            error!("Failed to send STOP: {}", e);
+                        }
+                        debug!("底盘已关闭");
+                    }
+                    Some(MotorCommand::EmergencyStop) => {
+                        is_started.store(false, Ordering::Relaxed);
+                        current_linear.store(0, Ordering::Relaxed);
+                        current_angular.store(0, Ordering::Relaxed);
+                        if let Err(e) = Self::write_command(&mut *port_commands, "BTN_XBOX") {
+                            error!("Failed to send EMERGENCY_STOP: {}", e);
+                        }
+                        warn!("⚠️ 紧急停止!");
+                    }
+                    Some(MotorCommand::ModeToggle) => {
+                        // Add cooldown to prevent rapid toggling
+                        if last_mode_toggle_time.elapsed() >= mode_toggle_cooldown {
+                            if let Err(e) = Self::write_command(&mut *port_commands, "BTN_A") {
+                                error!("Failed to send MODE_TOGGLE: {}", e);
                             }
-                        }
-                        None => {
-                            return Err(JetsonError::Motor("command channel closed".into()));
+                            debug!("发送模式切换命令");
+                            last_mode_toggle_time = std::time::Instant::now();
                         }
                     }
-                }
-
-                // Periodic control: re-send current speed or heartbeat
-                _ = control_timer.tick() => {
-                    if cmd_active {
-                        let data = MotorCommand::Speed {
-                            linear: current_speed.0,
-                            angular: current_speed.1,
-                        }.to_bytes();
-                        writer.write_all(&data).await
-                            .map_err(|e| JetsonError::Motor(format!("serial write: {}", e)))?;
+                    Some(MotorCommand::Heartbeat) => {
+                        if let Err(e) = Self::write_command(&mut *port_commands, "HEARTBEAT") {
+                            debug!("Failed to send heartbeat: {}", e);
+                        }
                     }
-                }
-
-                // Heartbeat when idle
-                _ = heartbeat_timer.tick() => {
-                    if !cmd_active {
-                        let data = MotorCommand::Heartbeat.to_bytes();
-                        writer.write_all(&data).await
-                            .map_err(|e| JetsonError::Motor(format!("serial write: {}", e)))?;
+                    None => {
+                        // Channel closed, stop
+                        info!("Command channel closed, stopping serial task");
+                        running.store(false, Ordering::Relaxed);
+                        break;
                     }
                 }
             }
+
+            // Clean shutdown
+            running.store(false, Ordering::Relaxed);
+            let _ = writer_handle.join();
+            let _ = reader_handle.join();
+            info!("STM32 serial task terminated, reconnecting in 1 second...");
+            std::thread::sleep(Duration::from_secs(1));
         }
     }
+}
 
-    /// Parse a message from STM32.
-    fn parse_stm32_message(line: &str) -> Stm32Message {
-        if line.contains("BALANCE_MODE") {
-            Stm32Message::Mode(RobotMode::Balance)
-        } else if line.contains("WALKING_MODE") {
-            Stm32Message::Mode(RobotMode::Walking)
-        } else if line == "PONG" {
-            Stm32Message::Pong
-        } else {
-            Stm32Message::Unknown(line.to_string())
+/// Helper function to update current mode from messages
+/// This should be called from the async task that receives messages
+pub async fn update_mode_from_messages<F>(
+    controller: &mut MotorController,
+    on_mode_change: Option<F>,
+) where
+    F: Fn(RobotMode) + Send + 'static,
+{
+    while let Some(msg) = controller.recv_message().await {
+        if let Stm32Message::Mode(mode) = msg {
+            let current = controller.current_mode();
+            if mode != current {
+                info!("🔄 模式切换: {}", mode.name());
+                if let Some(ref callback) = on_mode_change {
+                    callback(mode);
+                }
+            }
         }
     }
 }
